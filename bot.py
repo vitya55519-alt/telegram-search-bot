@@ -32,17 +32,20 @@ if not all([API_ID, API_HASH]):
 class TelegramSearchBot:
     def __init__(self):
         self.client = TelegramClient('user_session', API_ID, API_HASH)
+        self.searching = False
         
     async def start(self):
         """Запуск бота"""
         await self.client.start()
-        logger.info("✅ Бот запущен")
+        logger.info("✅ Бот запущен и готов")
         
+        # Обработчик для всех входящих сообщений в личные чаты
         self.client.add_event_handler(
             self.handle_search_message,
-            events.NewMessage(incoming=True)
+            events.NewMessage(incoming=True, from_users=None)
         )
         
+        logger.info("✅ Обработчик событий зарегистрирован")
         await self.client.run_until_disconnected()
     
     async def resolve_user(self, query: str) -> Optional[User]:
@@ -97,7 +100,7 @@ class TelegramSearchBot:
         all_chats = []
         processed_ids = set()
         
-        logger.info(f"Сканирование диалогов...")
+        logger.info(f"Сканирование диалогов для поиска {user.id}...")
         try:
             async for dialog in self.client.iter_dialogs(limit=None):
                 if isinstance(dialog.entity, User):
@@ -112,11 +115,11 @@ class TelegramSearchBot:
                     })
                     processed_ids.add(dialog.entity.id)
             
-            logger.info(f"Найдено {len(all_chats)} диалогов")
+            logger.info(f"Найдено {len(all_chats)} диалогов для сканирования")
         except Exception as e:
             logger.error(f"Ошибка диалогов: {e}")
         
-        logger.info(f"Поиск в {len(all_chats)} чатах...")
+        logger.info(f"Начинаю поиск в {len(all_chats)} чатах...")
         
         for idx, chat_data in enumerate(all_chats, 1):
             try:
@@ -155,7 +158,7 @@ class TelegramSearchBot:
                 except (ChannelPrivateError, UserNotParticipantError):
                     continue
                 except FloodWaitError as e:
-                    logger.warning(f"FloodWait: {e.seconds}s")
+                    logger.warning(f"FloodWait: {e.seconds}s, ждем...")
                     await asyncio.sleep(min(e.seconds, 10))
                     continue
                 except Exception as e:
@@ -174,7 +177,7 @@ class TelegramSearchBot:
                 await asyncio.sleep(0.1)
                     
             except Exception as e:
-                logger.debug(f"Ошибка: {e}")
+                logger.debug(f"Ошибка обработки: {e}")
                 continue
         
         logger.info(f"Найдено {results['total_messages']} сообщений в {len(results['chats'])} чатах")
@@ -233,60 +236,76 @@ class TelegramSearchBot:
     async def handle_search_message(self, event):
         """Обработка входящих сообщений"""
         
-        if event.out:
-            return
-        
-        if not event.message.text:
-            return
-        
-        query = event.message.text.strip()
-        
-        is_search = (
-            query.startswith('@') or 
-            query.startswith('+') or 
-            (query.isdigit() and len(query) >= 5)
-        )
-        
-        if not is_search:
-            return
-        
-        logger.info(f"🔍 Поиск: {query}")
-        
-        status = await event.respond(f"⏳ Ищу `{query}`...")
-        
         try:
-            user = await self.resolve_user(query)
-            
-            if not user:
-                await status.edit("❌ Не найден")
+            # Игнорируем свои сообщения
+            if event.out:
                 return
             
-            user_name = f"@{user.username}" if user.username else user.first_name
-            await status.edit(f"🔎 Сканирую чаты для {user_name}...")
+            if not event.message.text:
+                return
             
-            results = await self.deep_search_user_messages(user)
-            formatted = await self.format_search_results(results, max_messages=4)
+            query = event.message.text.strip()
+            
+            # Проверяем формат поиска
+            is_search = (
+                query.startswith('@') or 
+                query.startswith('+') or 
+                (query.isdigit() and len(query) >= 5)
+            )
+            
+            if not is_search:
+                return
+            
+            # Если уже идёт поиск - не начинаем новый
+            if self.searching:
+                await event.respond("⏳ Уже ищу... подожди")
+                return
+            
+            self.searching = True
+            logger.info(f"🔍 Поиск: {query}")
+            
+            status = await event.respond(f"⏳ Ищу `{query}`...")
             
             try:
-                await status.delete()
-            except:
-                pass
-            
-            for idx, part in enumerate(formatted, 1):
-                if len(formatted) > 1:
-                    header = f"**📄 {idx}/{len(formatted)}**\n\n"
-                    await event.respond(header + part)
-                else:
-                    await event.respond(part)
+                user = await self.resolve_user(query)
                 
-                await asyncio.sleep(1)
+                if not user:
+                    await status.edit("❌ Не найден")
+                    self.searching = False
+                    return
+                
+                user_name = f"@{user.username}" if user.username else user.first_name
+                await status.edit(f"🔎 Сканирую чаты для {user_name}...")
+                
+                results = await self.deep_search_user_messages(user)
+                formatted = await self.format_search_results(results, max_messages=4)
+                
+                try:
+                    await status.delete()
+                except:
+                    pass
+                
+                for idx, part in enumerate(formatted, 1):
+                    if len(formatted) > 1:
+                        header = f"**📄 {idx}/{len(formatted)}**\n\n"
+                        await event.respond(header + part)
+                    else:
+                        await event.respond(part)
+                    
+                    await asyncio.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"Ошибка: {e}")
+                try:
+                    await status.edit(f"❌ {str(e)}")
+                except:
+                    pass
             
+            finally:
+                self.searching = False
+        
         except Exception as e:
-            logger.error(f"Ошибка: {e}")
-            try:
-                await status.edit(f"❌ {str(e)}")
-            except:
-                pass
+            logger.error(f"Критическая ошибка обработчика: {e}")
 
 
 async def main():
@@ -302,4 +321,3 @@ async def main():
 
 if __name__ == '__main__':
     asyncio.run(main())
-
