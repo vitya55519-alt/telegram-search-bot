@@ -80,6 +80,7 @@ class DeepSearchBot:
         self.user = TelegramClient(USER_SESSION, API_ID, API_HASH)
         self.bot = TelegramClient(BOT_SESSION, API_ID, API_HASH)
         self.busy = False
+        self.owner_ids = {ADMIN_ID}
 
     # ---------------------------------------------------------------- запуск
     async def start(self) -> None:
@@ -91,7 +92,9 @@ class DeepSearchBot:
             )
 
         me = await self.user.get_me()
+        self.owner_ids.add(me.id)
         logger.info("Сканер: %s (ID: %s)", fmt_user(me), me.id)
+        logger.info("Владельцы бота: %s", sorted(self.owner_ids))
 
         await self.bot.start(bot_token=BOT_TOKEN)
         bot_me = await self.bot.get_me()
@@ -109,7 +112,13 @@ class DeepSearchBot:
 
     # ------------------------------------------------------------ обработчики
     async def cmd_start(self, event: events.NewMessage.Event) -> None:
+        logger.info("Входящее /start от ID %s", event.sender_id)
         if not self.is_admin(event):
+            await event.respond(
+                f"Ваш ID: <code>{event.sender_id}</code>\n"
+                "Доступ к поиску не выдан.",
+                parse_mode="html",
+            )
             return
         chats = await self.count_chats()
         await event.respond(
@@ -122,11 +131,22 @@ class DeepSearchBot:
 
     async def cmd_help(self, event: events.NewMessage.Event) -> None:
         if not self.is_admin(event):
+            await event.respond(
+                f"Ваш ID: <code>{event.sender_id}</code>\n"
+                "Доступ к поиску не выдан.",
+                parse_mode="html",
+            )
             return
         await event.respond(HELP_TEXT, parse_mode="html")
 
     async def cmd_search(self, event: events.NewMessage.Event) -> None:
+        logger.info("Входящее /search от ID %s", event.sender_id)
         if not self.is_admin(event):
+            await event.respond(
+                f"Ваш ID: <code>{event.sender_id}</code>\n"
+                "Доступ к поиску не выдан.",
+                parse_mode="html",
+            )
             return
         parts = (event.message.text or "").split(maxsplit=1)
         if len(parts) < 2 or not parts[1].strip():
@@ -137,16 +157,21 @@ class DeepSearchBot:
         await self.run_search(event, parts[1].strip())
 
     async def cmd_any(self, event: events.NewMessage.Event) -> None:
-        if not self.is_admin(event):
-            return
         text = (event.message.text or "").strip()
+        logger.info("Входящее от ID %s: %s", event.sender_id, text[:40])
         if not text or text.startswith("/"):
+            return
+        if not self.is_admin(event):
+            await event.respond(
+                f"Ваш ID: <code>{event.sender_id}</code>\n"
+                "Доступ к поиску не выдан.",
+                parse_mode="html",
+            )
             return
         await self.run_search(event, text)
 
-    @staticmethod
-    def is_admin(event: events.NewMessage.Event) -> bool:
-        return event.sender_id == ADMIN_ID
+    def is_admin(self, event: events.NewMessage.Event) -> bool:
+        return event.sender_id in self.owner_ids
 
     # --------------------------------------------------------------- сервис
     async def scanner_nick(self) -> str:
