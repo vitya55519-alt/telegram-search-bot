@@ -241,6 +241,9 @@ class DeepSearchBot:
                 result = await self.user(
                     functions.messages.SearchGlobalRequest(
                         q=f"@{user.username}",
+                        filter=types.InputMessagesFilterEmpty(),
+                        min_date=None,
+                        max_date=None,
                         offset_rate=0,
                         offset_peer=types.InputPeerEmpty(),
                         offset_id=0,
@@ -383,7 +386,7 @@ class DeepSearchBot:
                         lines.append(f'  <a href="{message["link"]}">→ Перейти</a>')
                 if chat["count"] > per_chat:
                     lines.append(f"… +{chat['count'] - per_chat} ещё")
-                blocks.append("\n".join(lines) + "\n")
+                blocks.append("\n".join(lines) + "\n\n")
 
         return self.split(header, blocks)
 
