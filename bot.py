@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Telegram User Bot для глубокого поиска комментариев пользователя
+Работает от одного авторизованного аккаунта
 """
 
 import os
@@ -37,15 +38,21 @@ class TelegramSearchBot:
     async def start(self):
         """Запуск бота"""
         await self.client.start()
-        logger.info("✅ Бот запущен и готов")
         
-        # Обработчик для всех входящих сообщений в личные чаты
+        me = await self.client.get_me()
+        logger.info(f"✅ Бот запущен: @{me.username or me.first_name} (ID: {me.id})")
+        
+        # Показываем статистику групп
+        dialogs = await self.client.get_dialogs()
+        groups_count = sum(1 for d in dialogs if not isinstance(d.entity, User))
+        logger.info(f"📊 Доступно {groups_count} групп/каналов для поиска")
+        
         self.client.add_event_handler(
             self.handle_search_message,
-            events.NewMessage(incoming=True, from_users=None)
+            events.NewMessage(incoming=True)
         )
         
-        logger.info("✅ Обработчик событий зарегистрирован")
+        logger.info("✅ Готов к поиску! Напиши @username, +телефон или ID")
         await self.client.run_until_disconnected()
     
     async def resolve_user(self, query: str) -> Optional[User]:
@@ -100,7 +107,7 @@ class TelegramSearchBot:
         all_chats = []
         processed_ids = set()
         
-        logger.info(f"Сканирование диалогов для поиска {user.id}...")
+        logger.info(f"Сканирование всех диалогов...")
         try:
             async for dialog in self.client.iter_dialogs(limit=None):
                 if isinstance(dialog.entity, User):
@@ -115,11 +122,11 @@ class TelegramSearchBot:
                     })
                     processed_ids.add(dialog.entity.id)
             
-            logger.info(f"Найдено {len(all_chats)} диалогов для сканирования")
+            logger.info(f"Найдено {len(all_chats)} чатов для сканирования")
         except Exception as e:
             logger.error(f"Ошибка диалогов: {e}")
         
-        logger.info(f"Начинаю поиск в {len(all_chats)} чатах...")
+        logger.info(f"Начинаю поиск сообщений в {len(all_chats)} чатах...")
         
         for idx, chat_data in enumerate(all_chats, 1):
             try:
@@ -158,7 +165,7 @@ class TelegramSearchBot:
                 except (ChannelPrivateError, UserNotParticipantError):
                     continue
                 except FloodWaitError as e:
-                    logger.warning(f"FloodWait: {e.seconds}s, ждем...")
+                    logger.warning(f"FloodWait: {e.seconds}s, пауза...")
                     await asyncio.sleep(min(e.seconds, 10))
                     continue
                 except Exception as e:
@@ -180,7 +187,7 @@ class TelegramSearchBot:
                 logger.debug(f"Ошибка обработки: {e}")
                 continue
         
-        logger.info(f"Найдено {results['total_messages']} сообщений в {len(results['chats'])} чатах")
+        logger.info(f"🎉 Найдено {results['total_messages']} сообщений в {len(results['chats'])} чатах")
         return results
     
     async def format_search_results(self, results: dict, max_messages: int = 5) -> List[str]:
@@ -194,26 +201,26 @@ class TelegramSearchBot:
         
         header = [
             f"🔍 **{user_name}** (ID: `{user_id}`)",
-            f"📊 Найдено: **{results['total_messages']}** сообщений в **{len(results['chats'])}** чатах\n",
+            f"📊 **{results['total_messages']}** сообщений в **{len(results['chats'])}** чатах\n",
             "─" * 50 + "\n"
         ]
         
         current.extend(header)
         
         if not results['chats']:
-            current.append("❌ Сообщения не найдены.")
+            current.append("❌ Сообщения не найдены в доступных чатах.")
             parts.append("\n".join(current))
             return parts
         
-        for chat in results['chats'][:20]:
+        for chat in results['chats'][:25]:
             section = [
                 f"**{chat['name']}**",
-                f"Сообщений: {chat['count']}"
+                f"📝 {chat['count']} сообщений"
             ]
             
             for msg in chat['messages'][:max_messages]:
                 date = msg['date'].strftime('%d.%m %H:%M')
-                text = msg['text'][:60] + ('...' if len(msg['text']) > 60 else '')
+                text = msg['text'][:55] + ('...' if len(msg['text']) > 55 else '')
                 section.append(f"• `{date}` {text}")
                 if msg['link']:
                     section.append(f"  [→]({msg['link']})")
@@ -237,7 +244,6 @@ class TelegramSearchBot:
         """Обработка входящих сообщений"""
         
         try:
-            # Игнорируем свои сообщения
             if event.out:
                 return
             
@@ -246,7 +252,6 @@ class TelegramSearchBot:
             
             query = event.message.text.strip()
             
-            # Проверяем формат поиска
             is_search = (
                 query.startswith('@') or 
                 query.startswith('+') or 
@@ -256,13 +261,12 @@ class TelegramSearchBot:
             if not is_search:
                 return
             
-            # Если уже идёт поиск - не начинаем новый
             if self.searching:
-                await event.respond("⏳ Уже ищу... подожди")
+                await event.respond("⏳ Уже ищу, подожди...")
                 return
             
             self.searching = True
-            logger.info(f"🔍 Поиск: {query}")
+            logger.info(f"🔍 Запрос: {query}")
             
             status = await event.respond(f"⏳ Ищу `{query}`...")
             
@@ -270,12 +274,12 @@ class TelegramSearchBot:
                 user = await self.resolve_user(query)
                 
                 if not user:
-                    await status.edit("❌ Не найден")
+                    await status.edit("❌ Пользователь не найден")
                     self.searching = False
                     return
                 
                 user_name = f"@{user.username}" if user.username else user.first_name
-                await status.edit(f"🔎 Сканирую чаты для {user_name}...")
+                await status.edit(f"🔎 Сканирую для {user_name}...")
                 
                 results = await self.deep_search_user_messages(user)
                 formatted = await self.format_search_results(results, max_messages=4)
@@ -295,9 +299,9 @@ class TelegramSearchBot:
                     await asyncio.sleep(1)
                 
             except Exception as e:
-                logger.error(f"Ошибка: {e}")
+                logger.error(f"Ошибка поиска: {e}")
                 try:
-                    await status.edit(f"❌ {str(e)}")
+                    await status.edit(f"❌ Ошибка: {str(e)}")
                 except:
                     pass
             
@@ -305,7 +309,8 @@ class TelegramSearchBot:
                 self.searching = False
         
         except Exception as e:
-            logger.error(f"Критическая ошибка обработчика: {e}")
+            logger.error(f"Ошибка обработчика: {e}")
+            self.searching = False
 
 
 async def main():
@@ -313,7 +318,7 @@ async def main():
     try:
         await bot.start()
     except KeyboardInterrupt:
-        logger.info("Остановлено")
+        logger.info("Бот остановлен")
     except Exception as e:
         logger.error(f"Ошибка: {e}")
         raise
