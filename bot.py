@@ -45,16 +45,10 @@ if not all([API_ID, API_HASH, BOT_TOKEN, ADMIN_ID]):
     raise ValueError("Заполните API_ID, API_HASH, BOT_TOKEN и ADMIN_ID!")
 
 HELP_TEXT = (
-    "🔍 <b>Глубокий поиск комментариев</b>\n\n"
     "Отправьте одно из значений:\n"
     "• <code>@nickname</code> — по нику\n"
-    "• <code>123456789</code> — по номеру пользователя\n"
-    "• <code>+7 999 123-45-67</code> — по телефону\n\n"
-    "Поиск идёт по всем чатам аккаунта-сканера, включая архив. "
-    "В отчёте: сколько сообщений найдено, в скольких чатах, "
-    "публичные и приватные, а также новые чаты, найденные через общие "
-    "чаты и глобальный поиск.\n\n"
-    "Команды: /search, /find или просто пришлите ник."
+    "• <code>123456789</code> — по id\n"
+    "• <code>+7 999 123-45-67</code> — по телефону"
 )
 
 
@@ -120,14 +114,7 @@ class DeepSearchBot:
                 parse_mode="html",
             )
             return
-        chats = await self.count_chats()
-        await event.respond(
-            f"👋 <b>Привет!</b>\n\n"
-            f"Сканирую через аккаунт @{await self.scanner_nick()}: "
-            f"вижу <b>{chats}</b> чатов и групп, включая архив.\n\n"
-            f"{HELP_TEXT}",
-            parse_mode="html",
-        )
+        await event.respond(HELP_TEXT, parse_mode="html")
 
     async def cmd_help(self, event: events.NewMessage.Event) -> None:
         if not self.is_admin(event):
@@ -174,17 +161,6 @@ class DeepSearchBot:
         return event.sender_id in self.owner_ids
 
     # --------------------------------------------------------------- сервис
-    async def scanner_nick(self) -> str:
-        me = await self.user.get_me()
-        return me.username or me.first_name or str(me.id)
-
-    async def count_chats(self) -> int:
-        total = 0
-        async for dialog in self.user.iter_dialogs():
-            if not dialog.is_user:
-                total += 1
-        return total
-
     async def resolve_user(self, query: str) -> Optional[User]:
         try:
             if query.startswith("+"):
