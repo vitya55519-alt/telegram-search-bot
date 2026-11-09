@@ -12,11 +12,12 @@ from io import BytesIO
 from typing import Optional
 
 from dotenv import load_dotenv
-from telethon import TelegramClient, events, functions
-from telethon.errors import FloodWaitError, RPCError
+from telethon import TelegramClient, events, functions, utils
+from telethon.errors import FloodWaitError, RPCError, SessionPasswordNeededError
 from telethon.sessions import StringSession
 from telethon.tl.types import Channel, User
 
+from accounts import create_client, load_accounts, save_account, delete_account
 from search_service import SearchRunner, PhraseSearchRunner, BulkSearchRunner, message_link
 
 logging.basicConfig(
@@ -50,7 +51,10 @@ HELP_TEXT = (
     "• <code>/words</code> — показать список слов\n"
     "• <code>/delword слово</code> — удалить слово\n"
     "• <code>/clearwords</code> — очистить список\n"
-    "• <code>/bulk</code> — загрузить .txt со списком @username / телефон / ID (до 500)"
+    "• <code>/bulk</code> — загрузить .txt со списком @username / телефон / ID (до 500)\n"
+    "• <code>/addaccount</code> — добавить Telegram-аккаунт для поиска по его группам\n"
+    "• <code>/accounts</code> — список подключённых аккаунтов\n"
+    "• <code>/delaccount номер</code> — удалить аккаунт из списка"
 )
 
 
@@ -77,6 +81,30 @@ class DeepSearchBot:
         self.owner_ids = {ADMIN_ID}
         self.scanner_id = None
         self.watch_words = []
+        self.extra_clients = {}
+        self.pending_logins = {}
+        self.recent_alerts = {}
+
+    @property
+    def all_user_clients(self):
+        return [self.user] + list(self.extra_clients.values())
+
+    async def start_extra_accounts(self):
+        accounts = await load_accounts(self.user)
+        for data in accounts:
+            try:
+                client = create_client(data["session"], API_ID, API_HASH)
+                await client.connect()
+                if not await client.is_user_authorized():
+                    logger.warning("Доп. аккаунт %s не авторизован, пропускаем", data.get("id"))
+                    await client.disconnect()
+                    continue
+                me = await client.get_me()
+                self.extra_clients[me.id] = client
+                client.add_event_handler(self.on_group_message, events.NewMessage(incoming=True))
+                logger.info("Дополнительный аккаунт подключён: %s", fmt_user(me))
+            except Exception as error:
+                logger.error("Ошибка подключения доп. аккаунта: %s", error)
 
     # ---------------------------------------------------------------- запуск
     async def start(self) -> None:
@@ -101,6 +129,7 @@ class DeepSearchBot:
         logger.info("Бот: @%s (ID: %s)", bot_me.username, bot_me.id)
 
         self.user.add_event_handler(self.on_group_message, events.NewMessage(incoming=True))
+        await self.start_extra_accounts()
 
         self.bot.add_event_handler(self.cmd_start, events.NewMessage(pattern=r"^/start"))
         self.bot.add_event_handler(self.cmd_help, events.NewMessage(pattern=r"^/help"))
@@ -113,6 +142,9 @@ class DeepSearchBot:
         self.bot.add_event_handler(self.cmd_delword, events.NewMessage(pattern=r"^/delword(?:\s|$)"))
         self.bot.add_event_handler(self.cmd_clearwords, events.NewMessage(pattern=r"^/clearwords$"))
         self.bot.add_event_handler(self.cmd_bulk, events.NewMessage(pattern=r"^/bulk(?:\s|$)"))
+        self.bot.add_event_handler(self.cmd_addaccount, events.NewMessage(pattern=r"^/addaccount$"))
+        self.bot.add_event_handler(self.cmd_accounts, events.NewMessage(pattern=r"^/accounts$"))
+        self.bot.add_event_handler(self.cmd_delaccount, events.NewMessage(pattern=r"^/delaccount(?:\s|$)"))
         self.bot.add_event_handler(self.cmd_any, events.NewMessage(incoming=True))
 
         logger.info("Готов к поиску")
@@ -169,6 +201,16 @@ class DeepSearchBot:
                 parse_mode="html",
             )
             return
+        pending = self.pending_logins.get(event.sender_id)
+        if pending:
+            step = pending.get("step")
+            if step == "phone":
+                await self._handle_login_phone(event, text)
+            elif step == "code":
+                await self._handle_login_code(event, text)
+            elif step == "password":
+                await self._handle_login_password(event, text)
+            return
         await self.run_search(event, text)
 
     def is_admin(self, event: events.NewMessage.Event) -> bool:
@@ -199,13 +241,101 @@ class DeepSearchBot:
                 except RPCError:
                     pass
 
-        runner = SearchRunner(
-            self.user, user, max_chats=MAX_CHATS, per_chat=MAX_PER_CHAT,
-            progress=progress,
-        )
-        result = await runner.run()
-        self.next_search_at = time.monotonic() + result["retry_after"]
-        return result
+        results = []
+        clients = self.all_user_clients
+        for index, client in enumerate(clients, 1):
+            await progress(f"Сканирую аккаунт {index}/{len(clients)}…")
+            runner = SearchRunner(
+                client, user, max_chats=MAX_CHATS, per_chat=MAX_PER_CHAT,
+                progress=progress,
+            )
+            results.append(await runner.run())
+        merged = self.merge_user_results(results)
+        self.next_search_at = time.monotonic() + merged.get("retry_after", 0)
+        return merged
+
+    @staticmethod
+    def merge_user_results(results: list[dict]) -> dict:
+        if not results:
+            return {}
+        chats = {}
+        mentions = {}
+        notes = []
+        retry_after = 0
+        checked = 0
+        external_checked = 0
+        skipped = 0
+        external_found = 0
+        for result in results:
+            retry_after = max(retry_after, result.get("retry_after", 0))
+            checked += result.get("checked", 0)
+            external_checked += result.get("external_checked", 0)
+            skipped += result.get("skipped", 0)
+            external_found += result.get("external_found", 0)
+            for note in result.get("notes", []):
+                if note not in notes:
+                    notes.append(note)
+            for chat in result.get("chats", []):
+                key = chat["name"]
+                existing = chats.setdefault(key, {
+                    "name": chat["name"], "public": chat.get("public"),
+                    "source": chat.get("source"), "messages": {}, "limited": False,
+                })
+                for message in chat["messages"]:
+                    existing["messages"][message["id"]] = message
+                existing["limited"] = existing["limited"] or chat.get("limited", False)
+            for item in result.get("mentions", []):
+                mentions[(item["chat"], item["id"])] = item
+        found = []
+        for chat in chats.values():
+            chat["messages"] = sorted(chat["messages"].values(), key=lambda m: m["date"], reverse=True)
+            chat["count"] = len(chat["messages"])
+            found.append(chat)
+        return {
+            "user": results[0]["user"], "chats": found,
+            "total_messages": sum(chat["count"] for chat in found),
+            "public": [chat for chat in found if chat.get("public")],
+            "private": [chat for chat in found if not chat.get("public")],
+            "discovered": [chat for chat in found if chat.get("source") != "dialogs"],
+            "external_found": external_found, "checked": checked,
+            "external_checked": external_checked, "skipped": skipped,
+            "mentions": list(mentions.values()), "notes": notes,
+            "retry_after": retry_after,
+        }
+
+    @staticmethod
+    def merge_chat_results(results: list[dict]) -> dict:
+        chats = {}
+        notes = []
+        retry_after = 0
+        checked = 0
+        skipped = 0
+        for result in results:
+            retry_after = max(retry_after, result.get("retry_after", 0))
+            checked += result.get("checked", 0)
+            skipped += result.get("skipped", 0)
+            for note in result.get("notes", []):
+                if note not in notes:
+                    notes.append(note)
+            for chat in result.get("chats", []):
+                key = chat["name"]
+                existing = chats.setdefault(key, {
+                    "name": chat["name"], "source": chat.get("source"),
+                    "messages": {}, "limited": False,
+                })
+                for message in chat["messages"]:
+                    existing["messages"][message["id"]] = message
+                existing["limited"] = existing["limited"] or chat.get("limited", False)
+        found = []
+        for chat in chats.values():
+            chat["messages"] = sorted(chat["messages"].values(), key=lambda m: m["date"], reverse=True)
+            chat["count"] = len(chat["messages"])
+            found.append(chat)
+        return {
+            "chats": found, "total_messages": sum(chat["count"] for chat in found),
+            "checked": checked, "skipped": skipped, "notes": notes,
+            "retry_after": retry_after,
+        }
 
     async def cmd_web(self, event: events.NewMessage.Event) -> None:
         logger.info("Входящее /web от ID %s", event.sender_id)
@@ -440,13 +570,26 @@ class DeepSearchBot:
                 except RPCError:
                     pass
 
-        runner = BulkSearchRunner(
-            self.user, users, max_chats=MAX_CHATS, per_chat=MAX_PER_CHAT,
-            scan_limit=BULK_SCAN_LIMIT, progress=progress,
-        )
-        result = await runner.run()
-        self.next_search_at = time.monotonic() + result["retry_after"]
-        return result
+        results = []
+        clients = self.all_user_clients
+        for index, client in enumerate(clients, 1):
+            await progress(f"Сканирую аккаунт {index}/{len(clients)}…")
+            runner = BulkSearchRunner(
+                client, users, max_chats=MAX_CHATS, per_chat=MAX_PER_CHAT,
+                scan_limit=BULK_SCAN_LIMIT, progress=progress,
+            )
+            results.append(await runner.run())
+        merged = self.merge_chat_results(results)
+        merged["users"] = users
+        merged["resolved"] = len(users)
+        found_user_ids = {
+            message["user_id"]
+            for chat in merged["chats"]
+            for message in chat["messages"]
+        }
+        merged["found_users"] = len(found_user_ids)
+        self.next_search_at = time.monotonic() + merged.get("retry_after", 0)
+        return merged
 
     async def run_bulk_search(self, event: events.NewMessage.Event, queries: list[str]) -> None:
         if self.busy:
@@ -552,9 +695,199 @@ class DeepSearchBot:
         finally:
             self.busy = False
 
+    async def cmd_addaccount(self, event: events.NewMessage.Event) -> None:
+        if not self.is_admin(event):
+            await event.respond(
+                f"Ваш ID: <code>{event.sender_id}</code>\n"
+                "Доступ к поиску не выдан.",
+                parse_mode="html",
+            )
+            return
+        self.pending_logins[event.sender_id] = {"step": "phone"}
+        await event.respond(
+            "Введите номер телефона добавляемого аккаунта в формате <code>+79991234567</code>.\n\n"
+            "Бот пришлёт код в Telegram этого аккаунта.",
+            parse_mode="html",
+        )
+
+    async def _handle_login_phone(self, event: events.NewMessage.Event, text: str) -> None:
+        phone = text.strip()
+        if not phone.startswith("+"):
+            await event.respond("Номер должен начинаться с <code>+</code>. Попробуйте снова <code>/addaccount</code>.", parse_mode="html")
+            self.pending_logins.pop(event.sender_id, None)
+            return
+        client = create_client("", API_ID, API_HASH)
+        try:
+            await client.connect()
+            sent = await client.send_code_request(phone)
+            self.pending_logins[event.sender_id] = {
+                "step": "code", "client": client, "phone": phone,
+                "phone_code_hash": sent.phone_code_hash,
+            }
+            await event.respond("Код отправлен. Введите его (только цифры).", parse_mode="html")
+        except FloodWaitError as error:
+            self.pending_logins.pop(event.sender_id, None)
+            await event.respond(f"Слишком много попыток. Повторите через {error.seconds} с.")
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        except Exception as error:
+            logger.error("Ошибка отправки кода: %s", error)
+            self.pending_logins.pop(event.sender_id, None)
+            await event.respond("Не удалось отправить код. Проверьте номер и попробуйте снова <code>/addaccount</code>.", parse_mode="html")
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+    async def _handle_login_code(self, event: events.NewMessage.Event, text: str) -> None:
+        pending = self.pending_logins.get(event.sender_id)
+        if not pending:
+            return
+        code = text.strip()
+        try:
+            await pending["client"].sign_in(
+                pending["phone"], code,
+                phone_code_hash=pending["phone_code_hash"],
+            )
+            await self._finish_add_account(event, pending["client"])
+        except SessionPasswordNeededError:
+            pending["step"] = "password"
+            await event.respond("У аккаунта включена двухэтапная авторизация. Введите пароль.", parse_mode="html")
+        except FloodWaitError as error:
+            self.pending_logins.pop(event.sender_id, None)
+            await event.respond(f"Слишком много попыток. Повторите через {error.seconds} с.")
+            try:
+                await pending["client"].disconnect()
+            except Exception:
+                pass
+        except Exception as error:
+            logger.error("Ошибка ввода кода: %s", error)
+            self.pending_logins.pop(event.sender_id, None)
+            await event.respond("Код не подошёл. Попробуйте снова <code>/addaccount</code>.", parse_mode="html")
+            try:
+                await pending["client"].disconnect()
+            except Exception:
+                pass
+
+    async def _handle_login_password(self, event: events.NewMessage.Event, text: str) -> None:
+        pending = self.pending_logins.get(event.sender_id)
+        if not pending:
+            return
+        try:
+            await pending["client"].sign_in(password=text.strip())
+            await self._finish_add_account(event, pending["client"])
+        except FloodWaitError as error:
+            self.pending_logins.pop(event.sender_id, None)
+            await event.respond(f"Слишком много попыток. Повторите через {error.seconds} с.")
+            try:
+                await pending["client"].disconnect()
+            except Exception:
+                pass
+        except Exception as error:
+            logger.error("Ошибка ввода пароля: %s", error)
+            self.pending_logins.pop(event.sender_id, None)
+            await event.respond("Пароль не подошёл. Попробуйте снова <code>/addaccount</code>.", parse_mode="html")
+            try:
+                await pending["client"].disconnect()
+            except Exception:
+                pass
+
+    async def _finish_add_account(self, event: events.NewMessage.Event, client: TelegramClient) -> None:
+        try:
+            me = await client.get_me()
+            session = client.session.save()
+            data = {"id": me.id, "username": me.username or "", "session": session}
+            await save_account(self.user, data)
+            self.extra_clients[me.id] = client
+            client.add_event_handler(self.on_group_message, events.NewMessage(incoming=True))
+            await event.respond(
+                f"✅ Аккаунт <b>{html_escape(fmt_user(me))}</b> добавлен.\n"
+                f"Его группы теперь участвуют в поиске и мониторинге.",
+                parse_mode="html",
+            )
+        except Exception as error:
+            logger.error("Ошибка сохранения аккаунта: %s", error)
+            await event.respond("Не удалось сохранить аккаунт. Попробуйте снова <code>/addaccount</code>.", parse_mode="html")
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        finally:
+            self.pending_logins.pop(event.sender_id, None)
+
+    async def cmd_accounts(self, event: events.NewMessage.Event) -> None:
+        if not self.is_admin(event):
+            await event.respond(
+                f"Ваш ID: <code>{event.sender_id}</code>\n"
+                "Доступ к поиску не выдан.",
+                parse_mode="html",
+            )
+            return
+        if not self.extra_clients:
+            await event.respond("Дополнительных аккаунтов пока нет.")
+            return
+        lines = []
+        for index, (uid, client) in enumerate(self.extra_clients.items(), 1):
+            try:
+                me = await client.get_me()
+                lines.append(f"{index}. {html_escape(fmt_user(me))} (ID: <code>{me.id}</code>)")
+            except Exception:
+                lines.append(f"{index}. [не удалось получить данные] ID: <code>{uid}</code>")
+        await event.respond(
+            "📋 <b>Подключённые дополнительные аккаунты:</b>\n" + "\n".join(lines),
+            parse_mode="html",
+        )
+
+    async def cmd_delaccount(self, event: events.NewMessage.Event) -> None:
+        if not self.is_admin(event):
+            await event.respond(
+                f"Ваш ID: <code>{event.sender_id}</code>\n"
+                "Доступ к поиску не выдан.",
+                parse_mode="html",
+            )
+            return
+        parts = (event.message.text or "").split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await event.respond(
+                "Напишите номер аккаунта из списка <code>/accounts</code>: <code>/delaccount 1</code>",
+                parse_mode="html",
+            )
+            return
+        try:
+            index = int(parts[1].strip()) - 1
+            if index < 0 or index >= len(self.extra_clients):
+                raise ValueError
+        except ValueError:
+            await event.respond("Неверный номер. Посмотрите список через <code>/accounts</code>.", parse_mode="html")
+            return
+        uid = list(self.extra_clients.keys())[index]
+        client = self.extra_clients.pop(uid)
+        try:
+            await delete_account(self.user, uid)
+            await client.disconnect()
+            await event.respond(f"Аккаунт <code>{uid}</code> удалён.", parse_mode="html")
+        except Exception as error:
+            logger.error("Ошибка удаления аккаунта: %s", error)
+            await event.respond("Не удалось удалить аккаунт.", parse_mode="html")
+
     async def on_group_message(self, event: events.NewMessage.Event) -> None:
         if event.out or event.is_private or not self.watch_words:
             return
+        chat_id = getattr(event, "chat_id", None)
+        if chat_id is None:
+            return
+        alert_key = (chat_id, event.message.id)
+        now = time.monotonic()
+        if self.recent_alerts.get(alert_key, 0) > now - 60:
+            return
+        self.recent_alerts[alert_key] = now
+        if len(self.recent_alerts) > 2000:
+            self.recent_alerts = {
+                k: v for k, v in self.recent_alerts.items() if now - v < 60
+            }
+
         text = (event.message.text or "").strip()
         if not text:
             return
@@ -775,13 +1108,19 @@ class DeepSearchBot:
                 except RPCError:
                     pass
 
-        runner = PhraseSearchRunner(
-            self.user, phrase, max_chats=MAX_CHATS, per_chat=MAX_PER_CHAT,
-            progress=progress,
-        )
-        result = await runner.run()
-        self.next_search_at = time.monotonic() + result["retry_after"]
-        return result
+        results = []
+        clients = self.all_user_clients
+        for index, client in enumerate(clients, 1):
+            await progress(f"Сканирую аккаунт {index}/{len(clients)}…")
+            runner = PhraseSearchRunner(
+                client, phrase, max_chats=MAX_CHATS, per_chat=MAX_PER_CHAT,
+                progress=progress,
+            )
+            results.append(await runner.run())
+        merged = self.merge_chat_results(results)
+        merged["phrase"] = phrase
+        self.next_search_at = time.monotonic() + merged.get("retry_after", 0)
+        return merged
 
     # -------------------------------------------------------------- сценарий
     async def run_search(self, event: events.NewMessage.Event, query: str) -> None:
