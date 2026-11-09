@@ -15,7 +15,7 @@ from telethon.errors import FloodWaitError, RPCError
 from telethon.sessions import StringSession
 from telethon.tl.types import User
 
-from search_service import SearchRunner
+from search_service import SearchRunner, PhraseSearchRunner
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -40,7 +40,9 @@ HELP_TEXT = (
     "Отправьте одно из значений:\n"
     "• <code>@nickname</code> — по нику\n"
     "• <code>123456789</code> — по id\n"
-    "• <code>+7 999 123-45-67</code> — по телефону"
+    "• <code>+7 999 123-45-67</code> — по телефону\n\n"
+    "Или команду:\n"
+    "• <code>/web фраза</code> — поиск по фразе в открытых группах/каналах"
 )
 
 
@@ -89,6 +91,7 @@ class DeepSearchBot:
         self.bot.add_event_handler(
             self.cmd_search, events.NewMessage(pattern=r"^/(?:search|find)(?:\s|$)")
         )
+        self.bot.add_event_handler(self.cmd_web, events.NewMessage(pattern=r"^/web(?:\s|$)"))
         self.bot.add_event_handler(self.cmd_any, events.NewMessage(incoming=True))
 
         logger.info("Готов к поиску")
@@ -183,6 +186,23 @@ class DeepSearchBot:
         self.next_search_at = time.monotonic() + result["retry_after"]
         return result
 
+    async def cmd_web(self, event: events.NewMessage.Event) -> None:
+        logger.info("Входящее /web от ID %s", event.sender_id)
+        if not self.is_admin(event):
+            await event.respond(
+                f"Ваш ID: <code>{event.sender_id}</code>\n"
+                "Доступ к поиску не выдан.",
+                parse_mode="html",
+            )
+            return
+        parts = (event.message.text or "").split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await event.respond(
+                "Напишите так: <code>/web Дзин Пиня</code>", parse_mode="html"
+            )
+            return
+        await self.run_phrase_search(event, parts[1].strip())
+
     # ------------------------------------------------------------ оформление
     def format_results(self, result: dict, per_chat: int = 100) -> list[str]:
         user = result["user"]
@@ -248,6 +268,46 @@ class DeepSearchBot:
 
         return self.split(header, blocks)
 
+    def format_phrase_results(self, result: dict, per_chat: int = 100) -> list[str]:
+        phrase = html_escape(result["phrase"])
+        header = (
+            f"🔍 <b>Результаты поиска по фразе:</b> <code>{phrase}</code>\n\n"
+            f"📊 <b>Статистика:</b>\n"
+            f"• Найдено сообщений: <b>{result['total_messages']}</b>\n"
+            f"• Чатов с результатами: <b>{len(result['chats'])}</b>\n"
+            f"• Проверено групп: <b>{result['checked']}</b>\n"
+            f"• Пропущено/недоступно: <b>{result['skipped']}</b>\n\n"
+        )
+        blocks = []
+        if result["notes"]:
+            blocks.append("<b>Ограничения поиска:</b>\n" + "\n".join(
+                "• " + html_escape(note) for note in result["notes"]
+            ) + "\n\n")
+        if not result["chats"]:
+            blocks.append("Сообщения с такой фразой в открытых источниках не найдены.\n\n")
+        else:
+            blocks.append("🔓 <b>ОТКРЫТЫЕ ГРУППЫ/КАНАЛЫ:</b>\n")
+            for chat in result["chats"][:15]:
+                lines = [
+                    f"<b>{html_escape(chat['name'])}</b>",
+                    f"📝 Сообщений: {chat['count']} ({chat['source']})",
+                ]
+                for message in chat["messages"][:per_chat]:
+                    date = message["date"].strftime("%d.%m.%Y %H:%M")
+                    text = html_escape(message["text"][:70])
+                    if len(message["text"]) > 70:
+                        text += "…"
+                    lines.append(f"• <code>{date}</code> {text}")
+                    if message["link"]:
+                        lines.append(f'  <a href="{message["link"]}">→ Перейти</a>')
+                if chat["count"] > per_chat:
+                    lines.append(f"… +{chat['count'] - per_chat} ещё")
+                blocks.append("\n".join(lines) + "\n\n")
+            if len(result["chats"]) > 15:
+                blocks.append(f"Ещё {len(result['chats']) - 15} групп с результатами не показаны.\n\n")
+
+        return self.split(header, blocks)
+
     @staticmethod
     def split(header: str, blocks: list[str], limit: int = 3600) -> list[str]:
         parts = []
@@ -279,6 +339,22 @@ class DeepSearchBot:
 
         flush()
         return parts
+
+    async def deep_phrase_search(self, phrase: str, status=None) -> dict:
+        async def progress(text):
+            if status:
+                try:
+                    await status.edit(text, parse_mode=None)
+                except RPCError:
+                    pass
+
+        runner = PhraseSearchRunner(
+            self.user, phrase, max_chats=MAX_CHATS, per_chat=MAX_PER_CHAT,
+            progress=progress,
+        )
+        result = await runner.run()
+        self.next_search_at = time.monotonic() + result["retry_after"]
+        return result
 
     # -------------------------------------------------------------- сценарий
     async def run_search(self, event: events.NewMessage.Event, query: str) -> None:
@@ -347,6 +423,70 @@ class DeepSearchBot:
             await event.respond(f"Telegram временно ограничил запросы. Повторите через {error.seconds} с.")
         except Exception as error:
             logger.error("Ошибка поиска: %s", type(error).__name__)
+            text = "Не удалось завершить поиск. Попробуйте позже."
+            try:
+                if status:
+                    await status.edit(text, parse_mode="html")
+                else:
+                    await event.respond(text, parse_mode="html")
+            except Exception:
+                pass
+        finally:
+            self.busy = False
+
+    async def run_phrase_search(self, event: events.NewMessage.Event, phrase: str) -> None:
+        if self.busy:
+            await event.respond("⏳ Уже ищу, подождите.")
+            return
+
+        remaining = self.next_search_at - time.monotonic()
+        if remaining > 0:
+            await event.respond(
+                f"Telegram временно ограничил запросы. Повторите через {int(remaining) + 1} с."
+            )
+            return
+        if len(phrase) > 200:
+            await event.respond("Фраза слишком длинная. Максимум 200 символов.")
+            return
+
+        self.busy = True
+        status = None
+        try:
+            status = await event.respond(
+                f"🔍 <b>Ищу по фразе:</b> <code>{html_escape(phrase)}</code>\n\n"
+                "Сканирую открытые группы… ⏳",
+                parse_mode="html",
+            )
+
+            result = await self.deep_phrase_search(phrase, status)
+            parts = self.format_phrase_results(result)
+
+            try:
+                await status.delete()
+            except Exception:
+                pass
+
+            for index, part in enumerate(parts, 1):
+                prefix = (
+                    f"📄 <b>Часть {index}/{len(parts)}</b>\n\n"
+                    if len(parts) > 1
+                    else ""
+                )
+                await event.respond(prefix + part, parse_mode="html")
+                await asyncio.sleep(0.4)
+
+            conclusion = "Поиск завершён с ограничениями." if result["notes"] else "Поиск завершён!"
+            await event.respond(
+                f"<b>{conclusion}</b>\n\n"
+                f"Найдено <b>{result['total_messages']}</b> сообщений "
+                f"в <b>{len(result['chats'])}</b> чатах.",
+                parse_mode="html",
+            )
+        except FloodWaitError as error:
+            self.next_search_at = time.monotonic() + error.seconds
+            await event.respond(f"Telegram временно ограничил запросы. Повторите через {error.seconds} с.")
+        except Exception as error:
+            logger.error("Ошибка поиска по фразе: %s", type(error).__name__)
             text = "Не удалось завершить поиск. Попробуйте позже."
             try:
                 if status:
