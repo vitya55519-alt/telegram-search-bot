@@ -8,7 +8,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 from urllib.request import Request, urlopen
 
 from telethon import functions, types, utils
-from telethon.errors import FloodWaitError, RPCError
+from telethon.errors import ChatAdminRequiredError, FloodWaitError, RPCError
 
 logger = logging.getLogger(__name__)
 PUBLIC_PATH = re.compile(r"/(?:s/)?([A-Za-z][A-Za-z0-9_]{3,31})(?:/([0-9]+))?/?")
@@ -311,11 +311,21 @@ class SearchRunner:
 
     async def scan_chat(self, chat):
         count = 0
-        async for message in self.client.iter_messages(
-            chat["entity"], from_user=self.user, limit=self.per_chat + 1,
-        ):
-            count += 1
-            self.remember(chat, message)
+        try:
+            async for message in self.client.iter_messages(
+                chat["entity"], from_user=self.user, limit=self.per_chat + 1,
+            ):
+                count += 1
+                self.remember(chat, message)
+        except ChatAdminRequiredError:
+            # В некоторых публичных каналах поиск по автору доступен только админам;
+            # читаем последние сообщения и фильтруем вручную.
+            async for message in self.client.iter_messages(
+                chat["entity"], limit=self.per_chat * 3,
+            ):
+                if is_authored(message, self.user.id) or is_mention(message, self.user):
+                    count += 1
+                    self.remember(chat, message)
         if count > self.per_chat:
             chat["limited"] = True
 
