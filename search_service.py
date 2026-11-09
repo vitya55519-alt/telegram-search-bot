@@ -102,8 +102,10 @@ class SearchRunner:
     async def request(self, request, label):
         try:
             return await asyncio.wait_for(self.client(request), timeout=25)
-        except FloodWaitError:
-            raise
+        except FloodWaitError as error:
+            self.retry_after = max(self.retry_after, error.seconds)
+            self.note(f"Telegram остановил запросы на {error.seconds} с.")
+            return None
         except (RPCError, asyncio.TimeoutError, ValueError) as error:
             logger.info("%s: %s", label, type(error).__name__)
             self.note(f"{label}: источник недоступен, охват неполный.")
@@ -163,8 +165,9 @@ class SearchRunner:
         try:
             async for dialog in self.client.iter_dialogs():
                 self.add_chat(dialog.entity, "dialogs", known=True)
-        except FloodWaitError:
-            raise
+        except FloodWaitError as error:
+            self.retry_after = max(self.retry_after, error.seconds)
+            self.note(f"Telegram остановил запросы на {error.seconds} с.")
         except RPCError as error:
             logger.info("Диалоги: %s", type(error).__name__)
             self.note("Не удалось полностью прочитать список ваших групп.")
@@ -277,13 +280,17 @@ class SearchRunner:
             return
         resolved = {}
         for username, message_id in references:
+            if self.retry_after:
+                break
             if username not in resolved:
                 try:
                     resolved[username] = await asyncio.wait_for(
                         self.client.get_entity("@" + username), timeout=15,
                     )
-                except FloodWaitError:
-                    raise
+                except FloodWaitError as error:
+                    self.retry_after = max(self.retry_after, error.seconds)
+                    self.note(f"Telegram остановил запросы на {error.seconds} с.")
+                    break
                 except (RPCError, ValueError, asyncio.TimeoutError):
                     resolved[username] = None
             entity = resolved[username]
@@ -295,8 +302,10 @@ class SearchRunner:
                     self.client.get_messages(entity, ids=message_id), timeout=15,
                 )
                 self.remember(chat, message)
-            except FloodWaitError:
-                raise
+            except FloodWaitError as error:
+                self.retry_after = max(self.retry_after, error.seconds)
+                self.note(f"Telegram остановил запросы на {error.seconds} с.")
+                break
             except (RPCError, ValueError, asyncio.TimeoutError):
                 self.note("Часть публикаций из интернет-поиска недоступна в Telegram.")
 
@@ -362,15 +371,14 @@ class SearchRunner:
                         await asyncio.wait_for(self.scan_chat(chat), timeout=30)
                         self.checked += 1
                         self.external_checked += int(key not in self.joined)
-                    except FloodWaitError:
-                        raise
+                    except FloodWaitError as error:
+                        self.retry_after = max(self.retry_after, error.seconds)
+                        self.note(f"Telegram остановил запросы на {error.seconds} с. Показана уже найденная часть.")
+                        break
                     except (RPCError, ValueError, asyncio.TimeoutError) as error:
                         self.skipped += 1
                         logger.info("Проверка группы: %s", type(error).__name__)
                     await asyncio.sleep(0.2)
-        except FloodWaitError as error:
-            self.retry_after = error.seconds
-            self.note(f"Telegram остановил запросы на {error.seconds} с. Показана уже найденная часть.")
         except asyncio.TimeoutError:
             self.note("Достигнут предел 10 минут; показана уже найденная часть.")
         if self.skipped:
