@@ -17,7 +17,7 @@ from telethon.errors import FloodWaitError, RPCError
 from telethon.sessions import StringSession
 from telethon.tl.types import Channel, User
 
-from search_service import SearchRunner, PhraseSearchRunner, message_link
+from search_service import SearchRunner, PhraseSearchRunner, BulkSearchRunner, message_link
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -34,6 +34,7 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 USER_SESSION_STRING = os.getenv("USER_SESSION_STRING", "")
 MAX_PER_CHAT = int(os.getenv("MAX_PER_CHAT", "300"))
 MAX_CHATS = int(os.getenv("MAX_CHATS", "300"))
+BULK_SCAN_LIMIT = int(os.getenv("BULK_SCAN_LIMIT", "5000"))
 
 if not all([API_ID, API_HASH, BOT_TOKEN, ADMIN_ID]):
     raise ValueError("Заполните API_ID, API_HASH, BOT_TOKEN и ADMIN_ID!")
@@ -48,7 +49,8 @@ HELP_TEXT = (
     "• <code>/addwords слова</code> — добавить слова для мониторинга (или .txt файл)\n"
     "• <code>/words</code> — показать список слов\n"
     "• <code>/delword слово</code> — удалить слово\n"
-    "• <code>/clearwords</code> — очистить список"
+    "• <code>/clearwords</code> — очистить список\n"
+    "• <code>/bulk</code> — загрузить .txt со списком @username / телефон / ID (до 500)"
 )
 
 
@@ -110,6 +112,7 @@ class DeepSearchBot:
         self.bot.add_event_handler(self.cmd_words, events.NewMessage(pattern=r"^/words$"))
         self.bot.add_event_handler(self.cmd_delword, events.NewMessage(pattern=r"^/delword(?:\s|$)"))
         self.bot.add_event_handler(self.cmd_clearwords, events.NewMessage(pattern=r"^/clearwords$"))
+        self.bot.add_event_handler(self.cmd_bulk, events.NewMessage(pattern=r"^/bulk(?:\s|$)"))
         self.bot.add_event_handler(self.cmd_any, events.NewMessage(incoming=True))
 
         logger.info("Готов к поиску")
@@ -361,6 +364,194 @@ class DeepSearchBot:
         await self.save_watch_words()
         await event.respond("Список слов очищен.")
 
+    async def cmd_bulk(self, event: events.NewMessage.Event) -> None:
+        if not self.is_admin(event):
+            await event.respond(
+                f"Ваш ID: <code>{event.sender_id}</code>\n"
+                "Доступ к поиску не выдан.",
+                parse_mode="html",
+            )
+            return
+        document = getattr(event.message, "document", None)
+        if not document:
+            await event.respond(
+                "Отправьте файл <code>.txt</code> с подписью <code>/bulk</code>.\n\n"
+                "В файле по одному значению на строку:\n"
+                "• <code>@username</code>\n"
+                "• <code>+79991234567</code>\n"
+                "• <code>123456789</code>",
+                parse_mode="html",
+            )
+            return
+        if not getattr(document, "mime_type", "").startswith("text/"):
+            await event.respond("Нужен текстовый файл <code>.txt</code>.", parse_mode="html")
+            return
+        if getattr(document, "size", 0) > 1024 * 1024:
+            await event.respond("Файл слишком большой. Максимум 1 МБ.", parse_mode="html")
+            return
+        try:
+            buffer = BytesIO()
+            await event.message.download_media(file=buffer)
+            buffer.seek(0)
+            content = buffer.read().decode("utf-8", errors="replace")
+        except Exception as error:
+            logger.error("Ошибка чтения файла: %s", error)
+            await event.respond("Не удалось прочитать файл.", parse_mode="html")
+            return
+        queries = [
+            line.strip() for line in content.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        queries = [q for q in queries if q.startswith(("@", "+")) or q.isdigit()]
+        queries = list(dict.fromkeys(queries))
+        if len(queries) > 500:
+            await event.respond("Максимум <b>500</b> значений за раз.", parse_mode="html")
+            return
+        if not queries:
+            await event.respond("В файле не найдены ники, телефоны или ID.", parse_mode="html")
+            return
+        await self.run_bulk_search(event, queries)
+
+    async def resolve_users(self, queries: list[str], progress=None) -> tuple[dict[int, User], list[str]]:
+        users: dict[int, User] = {}
+        failed: list[str] = []
+        total = len(queries)
+        for index, query in enumerate(queries, 1):
+            if progress and index % 10 == 0:
+                await progress(f"Распознаю пользователей: {index}/{total}…")
+            try:
+                user = await asyncio.wait_for(self.resolve_user(query), timeout=15)
+            except FloodWaitError:
+                raise
+            except Exception:
+                user = None
+            if user:
+                users[user.id] = user
+            else:
+                failed.append(query)
+            await asyncio.sleep(0.1)
+        return users, failed
+
+    async def deep_bulk_search(self, users: dict[int, User], status=None) -> dict:
+        async def progress(text):
+            if status:
+                try:
+                    await status.edit(text, parse_mode=None)
+                except RPCError:
+                    pass
+
+        runner = BulkSearchRunner(
+            self.user, users, max_chats=MAX_CHATS, per_chat=MAX_PER_CHAT,
+            scan_limit=BULK_SCAN_LIMIT, progress=progress,
+        )
+        result = await runner.run()
+        self.next_search_at = time.monotonic() + result["retry_after"]
+        return result
+
+    async def run_bulk_search(self, event: events.NewMessage.Event, queries: list[str]) -> None:
+        if self.busy:
+            await event.respond("⏳ Уже ищу, подождите.")
+            return
+
+        remaining = self.next_search_at - time.monotonic()
+        if remaining > 0:
+            await event.respond(
+                f"Telegram временно ограничил запросы. Повторите через {int(remaining) + 1} с."
+            )
+            return
+
+        self.busy = True
+        status = None
+        try:
+            status = await event.respond(
+                f"🔍 <b>Массовый поиск:</b> {len(queries)} значений\n\n"
+                "Распознаю пользователей… ⏳",
+                parse_mode="html",
+            )
+
+            async def progress(text):
+                if status:
+                    try:
+                        await status.edit(text, parse_mode=None)
+                    except RPCError:
+                        pass
+
+            try:
+                users, failed = await self.resolve_users(queries, progress=progress)
+            except FloodWaitError as error:
+                self.next_search_at = time.monotonic() + error.seconds
+                await event.respond(
+                    f"Telegram временно ограничил запросы при распознавании. "
+                    f"Повторите через {error.seconds} с."
+                )
+                return
+
+            if not users:
+                await status.edit(
+                    "❌ Ни одного пользователя не удалось распознать.\n"
+                    "Проверьте формат: @username, +телефон или ID.",
+                    parse_mode="html",
+                )
+                return
+
+            await status.edit(
+                f"✅ Распознано пользователей: <b>{len(users)}</b> из <b>{len(queries)}</b>\n\n"
+                "Сканирую группы… ⏳",
+                parse_mode="html",
+            )
+
+            result = await self.deep_bulk_search(users, status)
+            result["failed"] = failed
+            result["total_queries"] = len(queries)
+            parts = self.format_bulk_results(result)
+
+            try:
+                await status.delete()
+            except Exception:
+                pass
+
+            for index, part in enumerate(parts, 1):
+                prefix = (
+                    f"📄 <b>Часть {index}/{len(parts)}</b>\n\n"
+                    if len(parts) > 1
+                    else ""
+                )
+                await event.respond(prefix + part, parse_mode="html")
+                await asyncio.sleep(0.4)
+
+            conclusion = "Поиск завершён с ограничениями." if result["notes"] else "Поиск завершён!"
+            await event.respond(
+                f"<b>{conclusion}</b>\n\n"
+                f"Найдено <b>{result['total_messages']}</b> сообщений "
+                f"от <b>{result['found_users']}</b> пользователей "
+                f"в <b>{len(result['chats'])}</b> чатах.",
+                parse_mode="html",
+            )
+
+            if failed:
+                failed_text = "<b>Не удалось распознать:</b>\n" + "\n".join(
+                    f"• <code>{html_escape(q)}</code>" for q in failed[:50]
+                )
+                if len(failed) > 50:
+                    failed_text += f"\n… и ещё {len(failed) - 50}."
+                await event.respond(failed_text, parse_mode="html")
+
+        except FloodWaitError as error:
+            self.next_search_at = time.monotonic() + error.seconds
+            await event.respond(f"Telegram временно ограничил запросы. Повторите через {error.seconds} с.")
+        except Exception as error:
+            logger.error("Ошибка массового поиска: %s", type(error).__name__)
+            text = "Не удалось завершить поиск. Попробуйте позже."
+            try:
+                if status:
+                    await status.edit(text, parse_mode="html")
+                else:
+                    await event.respond(text, parse_mode="html")
+            except Exception:
+                pass
+        finally:
+            self.busy = False
+
     async def on_group_message(self, event: events.NewMessage.Event) -> None:
         if event.out or event.is_private or not self.watch_words:
             return
@@ -491,6 +682,49 @@ class DeepSearchBot:
                     if len(message["text"]) > 70:
                         text += "…"
                     lines.append(f"• <code>{date}</code> {text}")
+                    if message["link"]:
+                        lines.append(f'  <a href="{message["link"]}">→ Перейти</a>')
+                if chat["count"] > per_chat:
+                    lines.append(f"… +{chat['count'] - per_chat} ещё")
+                blocks.append("\n".join(lines) + "\n\n")
+            if len(result["chats"]) > 15:
+                blocks.append(f"Ещё {len(result['chats']) - 15} групп с результатами не показаны.\n\n")
+
+        return self.split(header, blocks)
+
+    def format_bulk_results(self, result: dict, per_chat: int = 100) -> list[str]:
+        header = (
+            f"🔍 <b>Результаты массового поиска</b>\n\n"
+            f"📊 <b>Статистика:</b>\n"
+            f"• Загружено значений: <b>{result.get('total_queries', 0)}</b>\n"
+            f"• Распознано пользователей: <b>{result['resolved']}</b>\n"
+            f"• Пользователей с сообщениями: <b>{result['found_users']}</b>\n"
+            f"• Найдено сообщений: <b>{result['total_messages']}</b>\n"
+            f"• Проверено групп: <b>{result['checked']}</b>\n"
+            f"• Пропущено/недоступно: <b>{result['skipped']}</b>\n\n"
+        )
+        blocks = []
+        if result["notes"]:
+            blocks.append("<b>Ограничения поиска:</b>\n" + "\n".join(
+                "• " + html_escape(note) for note in result["notes"]
+            ) + "\n\n")
+        if not result["chats"]:
+            blocks.append("Сообщения в ваших группах не найдены.\n\n")
+        else:
+            blocks.append("💬 <b>ГРУППЫ/КАНАЛЫ С КОММЕНТАРИЯМИ:</b>\n")
+            for chat in result["chats"][:15]:
+                lines = [
+                    f"<b>{html_escape(chat['name'])}</b>",
+                    f"📝 Сообщений: {chat['count']}",
+                ]
+                for message in chat["messages"][:per_chat]:
+                    date = message["date"].strftime("%d.%m.%Y %H:%M")
+                    text = html_escape(message["text"][:70])
+                    if len(message["text"]) > 70:
+                        text += "…"
+                    lines.append(
+                        f"• <code>{date}</code> <b>{html_escape(message['user'])}</b>: {text}"
+                    )
                     if message["link"]:
                         lines.append(f'  <a href="{message["link"]}">→ Перейти</a>')
                 if chat["count"] > per_chat:

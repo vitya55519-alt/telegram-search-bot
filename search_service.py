@@ -80,6 +80,13 @@ def is_mention(message, user):
     ))
 
 
+def fmt_user(user):
+    if getattr(user, "username", None):
+        return f"@{user.username}"
+    name = " ".join(part for part in (user.first_name, user.last_name) if part).strip()
+    return name or str(user.id)
+
+
 class SearchRunner:
     def __init__(self, client, user, max_chats=300, per_chat=300, progress=None):
         self.client = client
@@ -626,6 +633,170 @@ class PhraseSearchRunner:
                 for index, (key, chat) in enumerate(items[:self.max_chats], 1):
                     await self.notify(
                         f"Проверяю группы: {index}/{min(len(items), self.max_chats)}."
+                    )
+                    try:
+                        await asyncio.wait_for(self.scan_chat(chat), timeout=30)
+                        self.checked += 1
+                    except FloodWaitError as error:
+                        self.retry_after = max(self.retry_after, error.seconds)
+                        self.note(f"Telegram остановил запросы на {error.seconds} с. Показана уже найденная часть.")
+                        break
+                    except (RPCError, ValueError, asyncio.TimeoutError) as error:
+                        self.skipped += 1
+                        logger.info("Проверка группы: %s", type(error).__name__)
+                    await asyncio.sleep(0.2)
+        except asyncio.TimeoutError:
+            self.note("Достигнут предел 10 минут; показана уже найденная часть.")
+        if self.skipped:
+            self.note(f"Не удалось проверить групп: {self.skipped}.")
+        return self.result()
+
+
+class BulkSearchRunner:
+    def __init__(self, client, users, max_chats=300, per_chat=100, scan_limit=5000, progress=None):
+        self.client = client
+        self.users = users
+        self.target_ids = set(users.keys())
+        self.max_chats = max_chats
+        self.per_chat = per_chat
+        self.scan_limit = scan_limit
+        self.progress = progress
+        self.chats = {}
+        self.notes = []
+        self.checked = 0
+        self.skipped = 0
+        self.retry_after = 0
+        self.last_progress = 0
+        self.user_counts = {user_id: 0 for user_id in users}
+
+    def note(self, text):
+        if text not in self.notes:
+            self.notes.append(text)
+
+    async def notify(self, text):
+        if not self.progress or time.monotonic() - self.last_progress < 4:
+            return
+        self.last_progress = time.monotonic()
+        await self.progress(text)
+
+    async def request(self, request, label):
+        try:
+            return await asyncio.wait_for(self.client(request), timeout=25)
+        except FloodWaitError as error:
+            self.retry_after = max(self.retry_after, error.seconds)
+            self.note(f"Telegram остановил запросы на {error.seconds} с.")
+            return None
+        except (RPCError, asyncio.TimeoutError, ValueError) as error:
+            logger.info("%s: %s", label, type(error).__name__)
+            self.note(f"{label}: источник недоступен, охват неполный.")
+            return None
+
+    def add_chat(self, entity, source):
+        if not isinstance(entity, (types.Channel, types.Chat)):
+            return None
+        key = utils.get_peer_id(entity)
+        if key in self.chats:
+            return self.chats[key]
+        if len(self.chats) >= self.max_chats:
+            self.note("Достигнут предел групп для проверки.")
+            return None
+        chat = {
+            "entity": entity, "name": entity.title, "source": source,
+            "messages": {}, "counts": {}, "limited": False,
+        }
+        self.chats[key] = chat
+        return chat
+
+    def remember(self, chat, message):
+        if not isinstance(message, types.Message):
+            return
+        peer = message.from_id
+        if not isinstance(peer, types.PeerUser) or peer.user_id not in self.target_ids:
+            return
+        if message.fwd_from is not None:
+            return
+        if len(chat["messages"]) >= self.per_chat and message.id not in chat["messages"]:
+            chat["limited"] = True
+            return
+        user = self.users[peer.user_id]
+        item = {
+            "id": message.id, "date": message.date,
+            "text": message.message or "[медиа/стикер/файл]",
+            "link": message_link(chat["entity"], message),
+            "chat": chat["name"], "user": fmt_user(user),
+            "user_id": user.id,
+        }
+        chat["messages"][message.id] = item
+        self.user_counts[user.id] = self.user_counts.get(user.id, 0) + 1
+
+    async def discover(self):
+        await self.notify("Собираю список ваших групп…")
+        try:
+            async for dialog in self.client.iter_dialogs():
+                if isinstance(dialog.entity, types.User):
+                    continue
+                self.add_chat(dialog.entity, "dialogs")
+        except FloodWaitError as error:
+            self.retry_after = max(self.retry_after, error.seconds)
+            self.note(f"Telegram остановил запросы на {error.seconds} с.")
+        except RPCError as error:
+            logger.info("Диалоги: %s", type(error).__name__)
+            self.note("Не удалось полностью прочитать список ваших групп.")
+
+    async def scan_chat(self, chat):
+        try:
+            async for message in self.client.iter_messages(
+                chat["entity"], limit=self.scan_limit,
+            ):
+                self.remember(chat, message)
+        except ChatAdminRequiredError:
+            for user_id in self.target_ids:
+                try:
+                    async for message in self.client.iter_messages(
+                        chat["entity"], from_user=user_id, limit=self.per_chat,
+                    ):
+                        self.remember(chat, message)
+                except (ChatAdminRequiredError, RPCError, ValueError, asyncio.TimeoutError):
+                    continue
+        except (RPCError, ValueError, asyncio.TimeoutError):
+            pass
+
+    def result(self):
+        found = []
+        for chat in self.chats.values():
+            if not chat["messages"]:
+                continue
+            found.append({
+                "name": chat["name"], "source": chat["source"],
+                "messages": sorted(chat["messages"].values(), key=lambda m: m["date"], reverse=True),
+                "count": len(chat["messages"]), "limited": chat["limited"],
+            })
+        if any(chat["limited"] for chat in self.chats.values()):
+            self.note(f"В отдельных группах достигнут предел {self.per_chat} сообщений; показаны не все.")
+        found_users = [user_id for user_id, count in self.user_counts.items() if count > 0]
+        return {
+            "users": self.users, "resolved": len(self.users),
+            "found_users": len(found_users), "chats": found,
+            "total_messages": sum(chat["count"] for chat in found),
+            "checked": self.checked, "skipped": self.skipped,
+            "notes": list(self.notes), "retry_after": self.retry_after,
+        }
+
+    async def run(self):
+        try:
+            async with asyncio.timeout(600):
+                try:
+                    async with asyncio.timeout(180):
+                        await self.discover()
+                except asyncio.TimeoutError:
+                    self.note("Время сбора групп истекло; проверяю уже собранные.")
+                items = list(self.chats.items())
+                if len(items) > self.max_chats:
+                    self.note(f"За один поиск проверяется не более {self.max_chats} групп; охват неполный.")
+                for index, (key, chat) in enumerate(items[:self.max_chats], 1):
+                    await self.notify(
+                        f"Проверяю группы: {index}/{min(len(items), self.max_chats)}. "
+                        f"Найдено сообщений: {sum(self.user_counts.values())}."
                     )
                     try:
                         await asyncio.wait_for(self.scan_chat(chat), timeout=30)
