@@ -184,7 +184,7 @@ class DeepSearchBot:
         return result
 
     # ------------------------------------------------------------ оформление
-    def format_results(self, result: dict, per_chat: int = 3) -> list[str]:
+    def format_results(self, result: dict, per_chat: int = 100) -> list[str]:
         user = result["user"]
         header = (
             f"🔍 <b>Результаты глубокого поиска для {html_escape(fmt_user(user))}</b>\n"
@@ -252,13 +252,32 @@ class DeepSearchBot:
     def split(header: str, blocks: list[str], limit: int = 3600) -> list[str]:
         parts = []
         current = header
-        for block in blocks:
-            if len(current) + len(block) > limit and current.strip():
+
+        def flush():
+            nonlocal current
+            if current.strip():
                 parts.append(current)
                 current = ""
-            current += block
-        if current.strip():
-            parts.append(current)
+
+        for block in blocks:
+            if len(block) <= limit:
+                if len(current) + len(block) > limit:
+                    flush()
+                current += block
+                continue
+
+            flush()
+            for line in block.splitlines(keepends=True):
+                if len(line) > limit:
+                    flush()
+                    for i in range(0, len(line), limit):
+                        parts.append(line[i:i + limit])
+                    continue
+                if current.strip() and len(current) + len(line) > limit:
+                    flush()
+                current += line
+
+        flush()
         return parts
 
     # -------------------------------------------------------------- сценарий
