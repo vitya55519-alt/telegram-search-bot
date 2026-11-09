@@ -5,17 +5,19 @@
 import asyncio
 import logging
 import os
+import re
 import time
 from html import escape as html_escape
+from io import BytesIO
 from typing import Optional
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, functions
 from telethon.errors import FloodWaitError, RPCError
 from telethon.sessions import StringSession
-from telethon.tl.types import User
+from telethon.tl.types import Channel, User
 
-from search_service import SearchRunner, PhraseSearchRunner
+from search_service import SearchRunner, PhraseSearchRunner, message_link
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -41,8 +43,12 @@ HELP_TEXT = (
     "• <code>@nickname</code> — по нику\n"
     "• <code>123456789</code> — по id\n"
     "• <code>+7 999 123-45-67</code> — по телефону\n\n"
-    "Или команду:\n"
-    "• <code>/web фраза</code> — поиск по фразе в открытых группах/каналах"
+    "Команды:\n"
+    "• <code>/web фраза</code> — поиск по фразе в открытых группах/каналах\n"
+    "• <code>/addwords слова</code> — добавить слова для мониторинга (или .txt файл)\n"
+    "• <code>/words</code> — показать список слов\n"
+    "• <code>/delword слово</code> — удалить слово\n"
+    "• <code>/clearwords</code> — очистить список"
 )
 
 
@@ -67,6 +73,8 @@ class DeepSearchBot:
         self.busy = False
         self.next_search_at = 0
         self.owner_ids = {ADMIN_ID}
+        self.scanner_id = None
+        self.watch_words = []
 
     # ---------------------------------------------------------------- запуск
     async def start(self) -> None:
@@ -78,13 +86,19 @@ class DeepSearchBot:
             )
 
         me = await self.user.get_me()
+        self.scanner_id = me.id
         self.owner_ids.add(me.id)
         logger.info("Сканер: %s (ID: %s)", fmt_user(me), me.id)
         logger.info("Владельцы бота: %s", sorted(self.owner_ids))
 
+        self.watch_words = await self.load_watch_words()
+        logger.info("Слов для мониторинга: %s", len(self.watch_words))
+
         await self.bot.start(bot_token=BOT_TOKEN)
         bot_me = await self.bot.get_me()
         logger.info("Бот: @%s (ID: %s)", bot_me.username, bot_me.id)
+
+        self.user.add_event_handler(self.on_group_message, events.NewMessage(incoming=True))
 
         self.bot.add_event_handler(self.cmd_start, events.NewMessage(pattern=r"^/start"))
         self.bot.add_event_handler(self.cmd_help, events.NewMessage(pattern=r"^/help"))
@@ -92,6 +106,10 @@ class DeepSearchBot:
             self.cmd_search, events.NewMessage(pattern=r"^/(?:search|find)(?:\s|$)")
         )
         self.bot.add_event_handler(self.cmd_web, events.NewMessage(pattern=r"^/web(?:\s|$)"))
+        self.bot.add_event_handler(self.cmd_addwords, events.NewMessage(pattern=r"^/addwords(?:\s|$)"))
+        self.bot.add_event_handler(self.cmd_words, events.NewMessage(pattern=r"^/words$"))
+        self.bot.add_event_handler(self.cmd_delword, events.NewMessage(pattern=r"^/delword(?:\s|$)"))
+        self.bot.add_event_handler(self.cmd_clearwords, events.NewMessage(pattern=r"^/clearwords$"))
         self.bot.add_event_handler(self.cmd_any, events.NewMessage(incoming=True))
 
         logger.info("Готов к поиску")
@@ -202,6 +220,181 @@ class DeepSearchBot:
             )
             return
         await self.run_phrase_search(event, parts[1].strip())
+
+    # ------------------------------------------------------ мониторинг слов
+    @staticmethod
+    def parse_words(text: str) -> list[str]:
+        if not text:
+            return []
+        words = []
+        for line in text.splitlines():
+            for token in re.split(r"[,\s]+", line):
+                token = token.strip().lower()
+                if token:
+                    words.append(token)
+        return words
+
+    def match_words(self, text: str) -> Optional[str]:
+        if not text or not self.watch_words:
+            return None
+        for word in self.watch_words:
+            pattern = r"(?i)(?<!\w)" + re.escape(word) + r"(?!\w)"
+            if re.search(pattern, text):
+                return word
+        return None
+
+    async def load_watch_words(self) -> list[str]:
+        try:
+            async for message in self.user.iter_messages("me", search="#watchwords", limit=1):
+                if message.message and message.message.startswith("#watchwords"):
+                    return self.parse_words(message.message[len("#watchwords"):].strip())
+        except Exception as error:
+            logger.error("Ошибка загрузки списка слов: %s", error)
+        return []
+
+    async def save_watch_words(self) -> None:
+        text = "#watchwords\n" + "\n".join(sorted(self.watch_words))
+        try:
+            async for message in self.user.iter_messages("me", search="#watchwords", limit=1):
+                if message.message and message.message.startswith("#watchwords"):
+                    await self.user.edit_message("me", message.id, text)
+                    return
+        except Exception as error:
+            logger.error("Ошибка обновления списка слов: %s", error)
+        try:
+            await self.user.send_message("me", text)
+        except Exception as error:
+            logger.error("Ошибка сохранения списка слов: %s", error)
+
+    async def cmd_addwords(self, event: events.NewMessage.Event) -> None:
+        if not self.is_admin(event):
+            await event.respond(
+                f"Ваш ID: <code>{event.sender_id}</code>\n"
+                "Доступ к поиску не выдан.",
+                parse_mode="html",
+            )
+            return
+        words = []
+        parts = (event.message.text or "").split(maxsplit=1)
+        if len(parts) > 1:
+            words.extend(self.parse_words(parts[1]))
+        document = getattr(event.message, "document", None)
+        if document and getattr(document, "mime_type", "").startswith("text/"):
+            size = getattr(document, "size", 0)
+            if size > 1024 * 1024:
+                await event.respond("Файл слишком большой. Максимум 1 МБ.")
+                return
+            try:
+                buffer = BytesIO()
+                await event.message.download_media(file=buffer)
+                buffer.seek(0)
+                content = buffer.read().decode("utf-8", errors="replace")
+                words.extend(self.parse_words(content))
+            except Exception as error:
+                logger.error("Ошибка чтения файла: %s", error)
+                await event.respond("Не удалось прочитать файл.")
+                return
+        words = [w for w in words if w]
+        if not words:
+            await event.respond(
+                "Не найдены слова.\n"
+                "Отправьте так: <code>/addwords слово1 слово2</code>\n"
+                "или прикрепите .txt файл с словами.",
+                parse_mode="html",
+            )
+            return
+        existing = set(self.watch_words)
+        added = [w for w in words if w not in existing]
+        self.watch_words = sorted(set(self.watch_words) | set(words))
+        await self.save_watch_words()
+        await event.respond(
+            f"Добавлено слов: <b>{len(added)}</b>.\n"
+            f"Всего в списке: <b>{len(self.watch_words)}</b>.",
+            parse_mode="html",
+        )
+
+    async def cmd_words(self, event: events.NewMessage.Event) -> None:
+        if not self.is_admin(event):
+            await event.respond(
+                f"Ваш ID: <code>{event.sender_id}</code>\n"
+                "Доступ к поиску не выдан.",
+                parse_mode="html",
+            )
+            return
+        if not self.watch_words:
+            await event.respond("Список слов пуст.")
+            return
+        text = "📋 <b>Слова для мониторинга:</b>\n" + "\n".join(
+            f"• <code>{html_escape(word)}</code>" for word in self.watch_words
+        )
+        await event.respond(text, parse_mode="html")
+
+    async def cmd_delword(self, event: events.NewMessage.Event) -> None:
+        if not self.is_admin(event):
+            await event.respond(
+                f"Ваш ID: <code>{event.sender_id}</code>\n"
+                "Доступ к поиску не выдан.",
+                parse_mode="html",
+            )
+            return
+        parts = (event.message.text or "").split(maxsplit=1)
+        if len(parts) < 2:
+            await event.respond("Напишите так: <code>/delword слово</code>", parse_mode="html")
+            return
+        word = parts[1].strip().lower()
+        if word in self.watch_words:
+            self.watch_words.remove(word)
+            await self.save_watch_words()
+            await event.respond(f"Слово <code>{html_escape(word)}</code> удалено.", parse_mode="html")
+        else:
+            await event.respond("Такого слова в списке нет.", parse_mode="html")
+
+    async def cmd_clearwords(self, event: events.NewMessage.Event) -> None:
+        if not self.is_admin(event):
+            await event.respond(
+                f"Ваш ID: <code>{event.sender_id}</code>\n"
+                "Доступ к поиску не выдан.",
+                parse_mode="html",
+            )
+            return
+        self.watch_words = []
+        await self.save_watch_words()
+        await event.respond("Список слов очищен.")
+
+    async def on_group_message(self, event: events.NewMessage.Event) -> None:
+        if event.out or event.is_private or not self.watch_words:
+            return
+        text = (event.message.text or "").strip()
+        if not text:
+            return
+        matched = self.match_words(text)
+        if not matched:
+            return
+        try:
+            chat = await event.get_chat()
+            sender = await event.get_sender()
+            chat_name = getattr(chat, "title", None) or (fmt_user(chat) if chat else "неизвестно")
+            sender_name = fmt_user(sender) if sender else str(event.sender_id)
+            link = message_link(chat, event.message) if isinstance(chat, Channel) else None
+            alert = (
+                f"⚠️ <b>Слово из списка:</b> <code>{html_escape(matched)}</code>\n"
+                f"💬 <b>Чат:</b> {html_escape(chat_name)}\n"
+                f"👤 <b>Автор:</b> {html_escape(sender_name)} "
+                f"(ID: <code>{event.sender_id}</code>)\n"
+                f"🕐 <b>Время:</b> <code>{event.message.date.strftime('%d.%m.%Y %H:%M')}</code>\n\n"
+                f"{html_escape(text[:400])}{'…' if len(text) > 400 else ''}"
+            )
+            if link:
+                alert += f'\n\n<a href="{html_escape(link, quote=True)}">→ Перейти к сообщению</a>'
+            for admin_id in self.owner_ids:
+                if admin_id == self.scanner_id:
+                    continue
+                try:
+                    await self.bot.send_message(admin_id, alert, parse_mode="html", link_preview=False)
+                except Exception:
+                    pass
+        except Exception as error:
+            logger.error("Ошибка мониторинга сообщения: %s", error)
 
     # ------------------------------------------------------------ оформление
     def format_results(self, result: dict, per_chat: int = 100) -> list[str]:
