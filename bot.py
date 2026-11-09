@@ -1,28 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Бот глубокого поиска комментариев пользователя.
-
-Схема работы:
-  * бот принимает запрос от администратора и присылает отчёт;
-  * поиск выполняет авторизованный аккаунт (сессия user_session),
-    поэтому видны все его чаты, включая архив.
-"""
+"""Поиск сообщений через отдельный авторизованный аккаунт Telegram."""
 
 import asyncio
 import logging
 import os
+import time
 from html import escape as html_escape
 from typing import Optional
 
 from dotenv import load_dotenv
-from telethon import TelegramClient, events, functions, types
-from telethon.errors import (
-    ChannelPrivateError,
-    FloodWaitError,
-    UserNotParticipantError,
-)
-from telethon.tl.types import Channel, User
+from telethon import TelegramClient, events, functions
+from telethon.errors import FloodWaitError, RPCError
+from telethon.sessions import StringSession
+from telethon.tl.types import User
+
+from search_service import SearchRunner
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -36,8 +29,7 @@ API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
-USER_SESSION = os.getenv("USER_SESSION", "user_session")
-BOT_SESSION = os.getenv("BOT_SESSION", "bot_session")
+USER_SESSION_STRING = os.getenv("USER_SESSION_STRING", "")
 MAX_PER_CHAT = int(os.getenv("MAX_PER_CHAT", "300"))
 MAX_CHATS = int(os.getenv("MAX_CHATS", "300"))
 
@@ -61,19 +53,17 @@ def fmt_user(user: User) -> str:
     return name or str(user.id)
 
 
-def msg_link(entity, message) -> Optional[str]:
-    if not isinstance(entity, Channel):
-        return None
-    if getattr(entity, "username", None):
-        return f"https://t.me/{entity.username}/{message.id}"
-    return f"https://t.me/c/{entity.id}/{message.id}"
-
-
 class DeepSearchBot:
     def __init__(self) -> None:
-        self.user = TelegramClient(USER_SESSION, API_ID, API_HASH)
-        self.bot = TelegramClient(BOT_SESSION, API_ID, API_HASH)
+        if not USER_SESSION_STRING:
+            raise ValueError("Добавьте USER_SESSION_STRING в закрытые переменные Railway.")
+        self.user = TelegramClient(
+            StringSession(USER_SESSION_STRING), API_ID, API_HASH,
+            flood_sleep_threshold=0, request_retries=0,
+        )
+        self.bot = TelegramClient(StringSession(), API_ID, API_HASH)
         self.busy = False
+        self.next_search_at = 0
         self.owner_ids = {ADMIN_ID}
 
     # ---------------------------------------------------------------- запуск
@@ -82,7 +72,7 @@ class DeepSearchBot:
         if not await self.user.is_user_authorized():
             raise RuntimeError(
                 "Сессия аккаунта-сканера не авторизована. "
-                "Обновите файл user_session.session."
+                "Обновите USER_SESSION_STRING в закрытых переменных Railway."
             )
 
         me = await self.user.get_me()
@@ -145,7 +135,7 @@ class DeepSearchBot:
 
     async def cmd_any(self, event: events.NewMessage.Event) -> None:
         text = (event.message.text or "").strip()
-        logger.info("Входящее от ID %s: %s", event.sender_id, text[:40])
+        logger.info("Входящее от ID %s", event.sender_id)
         if not text or text.startswith("/"):
             return
         if not self.is_admin(event):
@@ -158,7 +148,7 @@ class DeepSearchBot:
         await self.run_search(event, text)
 
     def is_admin(self, event: events.NewMessage.Event) -> bool:
-        return event.sender_id in self.owner_ids
+        return event.is_private and event.sender_id in self.owner_ids
 
     # --------------------------------------------------------------- сервис
     async def resolve_user(self, query: str) -> Optional[User]:
@@ -167,182 +157,31 @@ class DeepSearchBot:
                 digits = "".join(ch for ch in query if ch.isdigit())
                 contacts = await self.user(functions.contacts.GetContactsRequest(hash=0))
                 for candidate in contacts.users:
-                    phone = getattr(candidate, "phone", None)
-                    if phone and "".join(ch for ch in phone if ch.isdigit()) == digits:
+                    if candidate.phone and candidate.phone == digits:
                         return candidate
                 return None
-
-            if query.isdigit():
-                try:
-                    entity = await self.user.get_entity(int(query))
-                except Exception:
-                    return None
-                return entity if isinstance(entity, User) else None
-
-            if query.startswith("@"):
-                try:
-                    entity = await self.user.get_entity(query)
-                except Exception:
-                    return None
-                return entity if isinstance(entity, User) else None
-
-            # ник без @ или имя
-            try:
-                entity = await self.user.get_entity(query)
-                if isinstance(entity, User):
-                    return entity
-            except Exception:
-                pass
-
-            found = await self.user(functions.contacts.SearchRequest(q=query, limit=10))
-            return found.users[0] if found.users else None
-        except Exception as error:
-            logger.warning("Не удалось найти %s: %s", query, error)
+            entity = await self.user.get_entity(int(query) if query.isdigit() else query)
+            return entity if isinstance(entity, User) else None
+        except FloodWaitError:
+            raise
+        except ValueError:
             return None
 
-    async def collect_chats(self, user: User) -> dict:
-        chats: dict[int, dict] = {}
-
-        try:
-            async for dialog in self.user.iter_dialogs():
-                entity = dialog.entity
-                if dialog.is_user or entity.id in chats:
-                    continue
-                chats[entity.id] = {
-                    "entity": entity,
-                    "name": dialog.name or getattr(entity, "title", str(entity.id)),
-                    "public": bool(getattr(entity, "username", None)),
-                    "source": "dialogs",
-                }
-        except Exception as error:
-            logger.error("Ошибка чтения диалогов: %s", error)
-
-        # общие чаты: там, где состоят и сканер, и искомый пользователь
-        try:
-            common = await self.user(
-                functions.messages.GetCommonChatsRequest(
-                    user_id=user.id, max_id=0, limit=100
-                )
-            )
-            for entity in common.chats:
-                if entity.id in chats:
-                    continue
-                chats[entity.id] = {
-                    "entity": entity,
-                    "name": getattr(entity, "title", str(entity.id)),
-                    "public": bool(getattr(entity, "username", None)),
-                    "source": "common",
-                }
-        except Exception as error:
-            logger.debug("Общие чаты недоступны: %s", error)
-
-        # глобальный поиск упоминаний ника
-        if getattr(user, "username", None):
-            try:
-                result = await self.user(
-                    functions.messages.SearchGlobalRequest(
-                        q=f"@{user.username}",
-                        filter=types.InputMessagesFilterEmpty(),
-                        min_date=None,
-                        max_date=None,
-                        offset_rate=0,
-                        offset_peer=types.InputPeerEmpty(),
-                        offset_id=0,
-                        limit=100,
-                    )
-                )
-                for entity in result.chats:
-                    if entity.id in chats:
-                        continue
-                    chats[entity.id] = {
-                        "entity": entity,
-                        "name": getattr(entity, "title", str(entity.id)),
-                        "public": bool(getattr(entity, "username", None)),
-                        "source": "global",
-                    }
-            except Exception as error:
-                logger.debug("Глобальный поиск недоступен: %s", error)
-
-        return chats
-
     async def deep_search(self, user: User, status=None) -> dict:
-        chats = await self.collect_chats(user)
-        logger.info("Чатов к проверке: %s", len(chats))
-
-        result = {
-            "user": user,
-            "chats": [],
-            "total_messages": 0,
-            "public": [],
-            "private": [],
-            "discovered": [],
-        }
-
-        items = list(chats.values())[:MAX_CHATS]
-        for index, chat in enumerate(items, 1):
-            entity = chat["entity"]
-
-            try:
-                messages = await asyncio.wait_for(
-                    self.scan_chat(entity, user), timeout=90
-                )
-            except asyncio.TimeoutError:
-                logger.debug("Пропуск по времени: %s", chat["name"])
-                continue
-            except FloodWaitError as error:
-                wait = min(error.seconds, 60)
-                logger.warning("Лимит Telegram, пауза %s с", wait)
-                await asyncio.sleep(wait)
-                continue
-            except (ChannelPrivateError, UserNotParticipantError):
-                continue
-            except Exception as error:
-                logger.debug("Ошибка в %s: %s", chat["name"], error)
-                continue
-
-            if messages:
-                info = {
-                    "name": chat["name"],
-                    "messages": messages,
-                    "count": len(messages),
-                    "public": chat["public"],
-                    "source": chat["source"],
-                }
-                result["chats"].append(info)
-                result["public" if chat["public"] else "private"].append(info)
-                if chat["source"] != "dialogs":
-                    result["discovered"].append(info)
-                result["total_messages"] += len(messages)
-                logger.info("%s: %s сообщений", chat["name"], len(messages))
-
-            if status and index % 5 == 0:
+        async def progress(text):
+            if status:
                 try:
-                    await status.edit(
-                        f"🔎 Проверено чатов: <b>{index}</b> из <b>{len(items)}</b>\n"
-                        f"Найдено сообщений: <b>{result['total_messages']}</b>",
-                        parse_mode="html",
-                    )
-                except Exception:
+                    await status.edit(text, parse_mode=None)
+                except RPCError:
                     pass
 
-            await asyncio.sleep(0.15)
-
+        runner = SearchRunner(
+            self.user, user, max_chats=MAX_CHATS, per_chat=MAX_PER_CHAT,
+            progress=progress,
+        )
+        result = await runner.run()
+        self.next_search_at = time.monotonic() + result["retry_after"]
         return result
-
-    async def scan_chat(self, entity, user: User) -> list:
-        messages = []
-        async for message in self.user.iter_messages(
-            entity, from_user=user.id, limit=MAX_PER_CHAT
-        ):
-            messages.append(
-                {
-                    "id": message.id,
-                    "date": message.date,
-                    "text": message.text or "[медиа/стикер/файл]",
-                    "link": msg_link(entity, message),
-                }
-            )
-        return messages
 
     # ------------------------------------------------------------ оформление
     def format_results(self, result: dict, per_chat: int = 3) -> list[str]:
@@ -355,14 +194,19 @@ class DeepSearchBot:
             f"• Всего чатов: <b>{len(result['chats'])}</b>\n"
             f"• Публичных: <b>{len(result['public'])}</b>\n"
             f"• Приватных: <b>{len(result['private'])}</b>\n"
-            f"• Обнаружено новых: <b>{len(result['discovered'])}</b>\n\n"
-            f"{'─' * 40}\n\n"
+            f"• Найдено источников вне подписок: <b>{result['external_found']}</b>\n"
+            f"• Проверено групп: <b>{result['checked']}</b>\n"
+            f"• Из них вне подписок: <b>{result['external_checked']}</b>\n"
+            f"• Вне подписок с сообщениями автора: <b>{len(result['discovered'])}</b>\n"
+            f"• Упоминаний отдельно: <b>{len(result['mentions'])}</b>\n\n"
         )
-
-        if not result["chats"]:
-            return [header + "❌ Сообщения не найдены."]
-
         blocks = []
+        if result["notes"]:
+            blocks.append("<b>Ограничения поиска:</b>\n" + "\n".join(
+                "• " + html_escape(note) for note in result["notes"]
+            ) + "\n\n")
+        if not result["chats"]:
+            blocks.append("Сообщения с подтверждённым авторством в проверенных источниках не найдены.\n\n")
         sections = [
             ("🔓 <b>ПУБЛИЧНЫЕ ГРУППЫ/КАНАЛЫ:</b>", result["public"]),
             ("🔒 <b>ПРИВАТНЫЕ ГРУППЫ:</b>", result["private"]),
@@ -388,6 +232,19 @@ class DeepSearchBot:
                 if chat["count"] > per_chat:
                     lines.append(f"… +{chat['count'] - per_chat} ещё")
                 blocks.append("\n".join(lines) + "\n\n")
+            if len(chats) > 15:
+                blocks.append(f"Ещё {len(chats) - 15} групп с результатами не показаны в кратком отчёте.\n\n")
+
+        if result["mentions"]:
+            blocks.append("<b>Упоминания — не сообщения этого автора:</b>\n\n")
+            for item in result["mentions"][:10]:
+                text = html_escape(item["text"][:180])
+                block = f"<b>{html_escape(item['chat'])}</b>\n{text}\n"
+                if item["link"]:
+                    block += f'<a href="{html_escape(item["link"], quote=True)}">Открыть</a>\n'
+                blocks.append(block + "\n")
+            if len(result["mentions"]) > 10:
+                blocks.append(f"Ещё упоминаний: {len(result['mentions']) - 10}.\n")
 
         return self.split(header, blocks)
 
@@ -410,6 +267,14 @@ class DeepSearchBot:
             await event.respond("⏳ Уже ищу, подождите.")
             return
 
+        remaining = self.next_search_at - time.monotonic()
+        if remaining > 0:
+            await event.respond(f"Telegram временно ограничил запросы. Повторите через {int(remaining) + 1} с.")
+            return
+        if len(query) > 200:
+            await event.respond("Запрос слишком длинный. Отправьте ник, id или телефон.")
+            return
+
         self.busy = True
         status = None
         try:
@@ -419,7 +284,7 @@ class DeepSearchBot:
                 parse_mode="html",
             )
 
-            user = await self.resolve_user(query)
+            user = await asyncio.wait_for(self.resolve_user(query), timeout=30)
             if not user:
                 await status.edit(
                     "❌ <b>Пользователь не найден</b>\n\n"
@@ -451,15 +316,19 @@ class DeepSearchBot:
                 await event.respond(prefix + part, parse_mode="html")
                 await asyncio.sleep(0.4)
 
+            conclusion = "Поиск завершён с ограничениями." if result["notes"] else "Поиск завершён!"
             await event.respond(
-                "✅ <b>Поиск завершён!</b>\n\n"
+                f"<b>{conclusion}</b>\n\n"
                 f"Найдено <b>{result['total_messages']}</b> сообщений "
                 f"в <b>{len(result['chats'])}</b> чатах.",
                 parse_mode="html",
             )
+        except FloodWaitError as error:
+            self.next_search_at = time.monotonic() + error.seconds
+            await event.respond(f"Telegram временно ограничил запросы. Повторите через {error.seconds} с.")
         except Exception as error:
-            logger.exception("Ошибка поиска")
-            text = f"❌ Ошибка поиска: <code>{html_escape(str(error))}</code>"
+            logger.error("Ошибка поиска: %s", type(error).__name__)
+            text = "Не удалось завершить поиск. Попробуйте позже."
             try:
                 if status:
                     await status.edit(text, parse_mode="html")

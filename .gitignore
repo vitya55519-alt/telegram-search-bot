@@ -28,7 +28,7 @@ wheels/
 
 # Telethon session files
 *.session
-*.session-journal
+*.session-*
 
 # IDEs
 .vscode/
